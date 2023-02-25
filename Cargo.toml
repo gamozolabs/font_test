@@ -7,5 +7,6 @@ edition = "2021"
 
 [dependencies]
 pollster = { version = "0.3.0", features = ["macro"] }
+rand = "0.8.5"
 wgpu = "0.15.1"
 winit = "0.28.1"

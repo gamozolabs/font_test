@@ -1,13 +1,15 @@
 use winit::event_loop::EventLoop;
 use winit::window::WindowBuilder;
 
+/// Log how long it took to execute `$tt`, using `$reason` as the status
+/// message of what was timed
 macro_rules! measure {
     ( $reason:expr, $tt:block ) => {
         {
             let it = std::time::Instant::now();
             let ret = $tt;
             let elapsed = it.elapsed().as_secs_f64() * 1000.;
-            println!("[{elapsed:12.3} ms] {}", $reason);
+            println!("[{elapsed:8.3} ms] {}", $reason);
             ret
         }
     }
@@ -16,11 +18,18 @@ macro_rules! measure {
 #[pollster::main]
 async fn main() {
     // Create an event loop
-    let event_loop = EventLoop::new();
+    let event_loop = measure!("Creating winit::EventLoop", {
+        EventLoop::new()
+    });
 
     // Create a window
-    let window = WindowBuilder::new().build(&event_loop)
-        .expect("Failed to build window");
+    let window = measure!("Creating winit::Window", {
+        WindowBuilder::new()
+            .with_inner_size(winit::dpi::PhysicalSize::new(800, 600))
+            .with_resizable(false)
+            .build(&event_loop)
+            .expect("Failed to build window")
+    });
 
     // Get an instance of wgpu
     let instance = measure!("Creating wgpu::Instance", {
@@ -31,8 +40,10 @@ async fn main() {
     });
 
     // Create a surface for our window
-    let surface = unsafe { instance.create_surface(&window) }
-        .expect("Failed to create surface for window");
+    let surface = measure!("Creating wgpu::Surface", {
+        unsafe { instance.create_surface(&window) }
+            .expect("Failed to create surface for window")
+    });
 
     // Get a physical card
     let adapter = measure!("Creating wgpu::Adapter", {
@@ -40,101 +51,120 @@ async fn main() {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: Some(&surface),
             ..Default::default()
-        }).await.unwrap()
+        }).await.expect("Failed to create Adapter")
     });
 
     // Get access to the device and a queue to issue commands to it
     let (device, queue) = measure!("Creating wgpu::Device", {
-        adapter.request_device(&Default::default(), None).await.unwrap()
+        adapter.request_device(&Default::default(), None).await
+            .expect("Failed to create Device")
     });
 
-    // Create the primary texture to render to
-    let texture = measure!("Creating primary texture", {
-        device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Primary render texture"),
-            size: wgpu::Extent3d {
-                width: 1920,
-                height: 1080,
-                depth_or_array_layers: 1,
+    // Compile the shader
+    let shader = measure!("Compiling shader", {
+        device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"))
+    });
+
+    // Create render pipeline
+    let render_pipeline = measure!("Creating render pipeline", {
+        let render_pipeline_layout = device.create_pipeline_layout(
+            &wgpu::PipelineLayoutDescriptor {
+                label: Some("Render Pipeline Layout"),
+                bind_group_layouts: &[],
+                push_constant_ranges: &[],
+            });
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Render Pipeline"),
+            layout: Some(&render_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &[],
             },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Bgra8UnormSrgb,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: Some(wgpu::Face::Back),
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
         })
     });
 
-    let tv = texture.create_view(&Default::default());
-
-    // Create a buffer that we can use to copy the primary texture to
-    let buffer = measure!("Creating primary buffer", {
-        device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Primary render buffer"),
-            size: 1920 * 1080 * 4,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
+    // Configure the surface
+    measure!("Configuring wgpu::Surface", {
+        surface.configure(&device, &wgpu::SurfaceConfiguration {
+            usage:        wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format:       wgpu::TextureFormat::Bgra8UnormSrgb,
+            width:        window.inner_size().width,
+            height:       window.inner_size().height,
+            present_mode: wgpu::PresentMode::Fifo,
+            alpha_mode:   wgpu::CompositeAlphaMode::Opaque,
+            view_formats: Vec::new(),
         })
     });
 
-    let bs = buffer.slice(..);
+    loop {
+        // Get the current vsync texture to present to for the surface (window)
+        let texture = surface.get_current_texture()
+            .expect("Failed to get current texture");
 
-    measure!("Copy!", {
-        for _ in 0..1000 {
-            let mut commands = device.create_command_encoder(&Default::default());
+        // Create a view of the texture
+        let tv = texture.texture.create_view(&Default::default());
 
-            commands.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: None,
-                color_attachments: &[
-                    Some(wgpu::RenderPassColorAttachment {
-                        view: &tv,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.1, g: 0.5, b: 1.0, a: 1.0 }),
-                            store: true,
-                        },
-                    })
-                ],
-                depth_stencil_attachment: None,
-            });
+        // Create a new command encoder
+        let mut commands = device.create_command_encoder(&Default::default());
 
-            commands.copy_texture_to_buffer(
-                wgpu::ImageCopyTexture {
-                    texture: &texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::ImageCopyBuffer {
-                    buffer: &buffer,
-                    layout: wgpu::ImageDataLayout {
-                        offset: 0,
-                        bytes_per_row: std::num::NonZeroU32::new(1920 * 4),
-                        rows_per_image: None,
-                    },
-                },
-                wgpu::Extent3d {
-                    width: 1920,
-                    height: 1080,
-                    depth_or_array_layers: 1,
-                },
-            );
+        {
+            // Start a render pass, clearing the screen to black
+            let mut render_pass = commands.begin_render_pass(
+                &wgpu::RenderPassDescriptor {
+                    label: None,
+                    color_attachments: &[
+                        Some(wgpu::RenderPassColorAttachment {
+                            view: &tv,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color {
+                                    r: 0.0, g: 0.0, b: 0.0, a: 1.0
+                                }),
+                                store: true,
+                            },
+                        })
+                    ],
+                    depth_stencil_attachment: None,
+                });
 
-            let idx = queue.submit(Some(commands.finish()));
+            render_pass.set_pipeline(&render_pipeline);
 
-            bs.map_async(wgpu::MapMode::Read, |res| {
-                res.unwrap();
-            });
-            device.poll(wgpu::MaintainBase::WaitForSubmissionIndex(idx));
-
-            {
-                let data = bs.get_mapped_range();
-                std::fs::write("image_data.data", &data).unwrap();
-            }
-
-            buffer.unmap();
+            // Draw that shit!
+            let val = rand::random::<u32>();
+            render_pass.draw(0..4, val..val.checked_add(1).unwrap());
         }
-    });
+
+        // Send the queue to the GPU
+        queue.submit(Some(commands.finish()));
+
+        // Present the texture to the surface
+        texture.present();
+    }
 }
 
