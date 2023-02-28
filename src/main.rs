@@ -279,11 +279,11 @@ async fn main() {
         FontSize::Size24x36,
     ];
     let mut strings = Vec::new();
-    for _ in 0..10000 {
+    for _ in 0..100 {
         strings.push((
             all_fonts[rand::random::<usize>() % all_fonts.len()],
             PushConstants {
-                xy:     (rand::random::<f32>() * WIDTH as f32, rand::random::<f32>() * HEIGHT as f32),
+                xy:     ((rand::random::<u32>() % WIDTH) as f32, (rand::random::<u32>() % HEIGHT) as f32),
                 rgba:   (rand::random::<f32>(), rand::random::<f32>(), rand::random::<f32>(), rand::random::<f32>()),
                 offset: 0,
             },
