@@ -6,6 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+image = "0.24.5"
 pollster = { version = "0.3.0", features = ["macro"] }
 rand = "0.8.5"
 wgpu = "0.15.1"
