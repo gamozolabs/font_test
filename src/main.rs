@@ -1,12 +1,14 @@
+mod fonts;
+
+use std::mem::size_of;
 use std::num::NonZeroU64;
 use std::collections::VecDeque;
 use winit::event_loop::EventLoop;
 use winit::window::WindowBuilder;
+use fonts::FontSize;
 
-mod fonts;
-
-const WIDTH:  u32 = 3840;
-const HEIGHT: u32 = 2160;
+const WIDTH:  u32 = 1440;
+const HEIGHT: u32 =  900;
 
 /// Log how long it took to execute `$tt`, using `$reason` as the status
 /// message of what was timed
@@ -22,21 +24,38 @@ macro_rules! measure {
     }
 }
 
-struct Rng(u64);
-
-impl Rng {
-    fn rand(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 17;
-        self.0 ^= self.0 << 43;
-        self.0
+unsafe trait Castable: Copy {
+    fn cast(&self) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(self as *const Self as *const u8,
+                std::mem::size_of_val(self))
+        }
     }
 }
 
+unsafe impl Castable for (f32, f32) {}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct Globals {
+    win_width:  f32,
+    win_height: f32,
+}
+
+unsafe impl Castable for Globals {}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct PushConstants {
+    rgba:      (f32, f32, f32, f32),
+    xy:        (f32, f32),
+    offset:    u32,
+}
+
+unsafe impl Castable for PushConstants {}
+
 #[pollster::main]
 async fn main() {
-    let mut rng = Rng(0x209e5223ce30b4);
-
     // Create an event loop
     let event_loop = measure!("Creating winit::EventLoop", {
         EventLoop::new()
@@ -76,8 +95,14 @@ async fn main() {
 
     // Get access to the device and a queue to issue commands to it
     let (device, queue) = measure!("Creating wgpu::Device", {
-        adapter.request_device(&Default::default(), None).await
-            .expect("Failed to create Device")
+        adapter.request_device(&wgpu::DeviceDescriptor {
+            features: wgpu::Features::PUSH_CONSTANTS,
+            limits:   wgpu::Limits {
+                max_push_constant_size: size_of::<PushConstants>() as u32,
+                ..Default::default()
+            },
+            ..Default::default()
+        }, None).await.expect("Failed to create Device")
     });
 
     // Compile the shader
@@ -91,13 +116,20 @@ async fn main() {
     });
 
     // Create buffer for text
-    const COLS:    u32 = (WIDTH  + 3) / 4;
-    const ROWS:    u32 = (HEIGHT + 5) / 6;
-    const LINE_SZ: u32 = (COLS * 4 + 255) / 256 * 256;
+    const FONT_BUFFER_SIZE: u64 = 1024 * 1024;
     let text_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label:              None,
-        size:               (LINE_SZ * ROWS) as u64,
+        size:               FONT_BUFFER_SIZE,
         usage:              wgpu::BufferUsages::STORAGE |
+                            wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    // Create buffer for globals to the shader
+    let global_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label:              None,
+        size:               size_of::<Globals>() as u64,
+        usage:              wgpu::BufferUsages::UNIFORM |
                             wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -114,10 +146,21 @@ async fn main() {
                         ty: wgpu::BufferBindingType::Storage {
                             read_only: true,
                         },
-                        has_dynamic_offset: true,
-                        min_binding_size: NonZeroU64::new(LINE_SZ as u64),
+                        has_dynamic_offset: false,
+                        min_binding_size: NonZeroU64::new(FONT_BUFFER_SIZE),
                     }
-                }
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    count: None,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size:
+                            NonZeroU64::new(size_of::<Globals>() as u64),
+                    }
+                },
             ],
             label:   None,
         });
@@ -133,7 +176,18 @@ async fn main() {
                         wgpu::BufferBinding {
                             buffer: &text_buffer,
                             offset: 0,
-                            size:   NonZeroU64::new(LINE_SZ as u64),
+                            size:   NonZeroU64::new(FONT_BUFFER_SIZE),
+                        }
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding:  1,
+                    resource: wgpu::BindingResource::Buffer(
+                        wgpu::BufferBinding {
+                            buffer: &global_buffer,
+                            offset: 0,
+                            size:
+                                NonZeroU64::new(size_of::<Globals>() as u64),
                         }
                     ),
                 },
@@ -150,7 +204,12 @@ async fn main() {
                     &fonts.bind_group_layout,
                     &bind_group_layout,
                 ],
-                push_constant_ranges: &[],
+                push_constant_ranges: &[
+                    wgpu::PushConstantRange {
+                        stages: wgpu::ShaderStages::VERTEX,
+                        range:  0..size_of::<PushConstants>() as u32,
+                    }
+                ],
             });
         device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Render Pipeline"),
@@ -195,13 +254,51 @@ async fn main() {
             format:       wgpu::TextureFormat::Bgra8UnormSrgb,
             width:        window.inner_size().width,
             height:       window.inner_size().height,
-            present_mode: wgpu::PresentMode::Immediate,
+            present_mode: wgpu::PresentMode::Fifo,
             alpha_mode:   wgpu::CompositeAlphaMode::Opaque,
             view_formats: Vec::new(),
         })
     });
 
-    let mut buf = Vec::new();
+    let globals = Globals {
+        win_width:  WIDTH  as f32,
+        win_height: HEIGHT as f32,
+    };
+    queue.write_buffer(&global_buffer, 0, globals.cast());
+
+    let all_fonts = [
+        FontSize::Size4x6,
+        FontSize::Size6x8,
+        FontSize::Size6x10,
+        FontSize::Size8x12,
+        FontSize::Size8x14,
+        FontSize::Size8x15,
+        FontSize::Size8x16,
+        FontSize::Size12x20,
+        FontSize::Size16x24,
+        FontSize::Size24x36,
+    ];
+    let mut strings = Vec::new();
+    for _ in 0..10000 {
+        strings.push((
+            all_fonts[rand::random::<usize>() % all_fonts.len()],
+            PushConstants {
+                xy:     (rand::random::<f32>() * WIDTH as f32, rand::random::<f32>() * HEIGHT as f32),
+                rgba:   (rand::random::<f32>(), rand::random::<f32>(), rand::random::<f32>(), rand::random::<f32>()),
+                offset: 0,
+            },
+            b"Hello world".as_slice(),
+        ));
+    }
+
+    // Allocate all text data in one big buffer
+    let mut text_data = Vec::new();
+    for (_, pc, msg) in &mut strings {
+        pc.offset = text_data.len() as u32 / 4;
+        text_data.extend_from_slice(*msg);
+        text_data.resize((text_data.len() + 3) & !3, 0u8);
+    }
+    queue.write_buffer(&text_buffer, 0, text_data.as_slice());
 
     let mut frame_times = VecDeque::new();
     let it = std::time::Instant::now();
@@ -215,14 +312,6 @@ async fn main() {
 
         // Create a new command encoder
         let mut commands = device.create_command_encoder(&Default::default());
-
-        buf.clear();
-        for row in 0..ROWS {
-            for chr in 0..COLS / 2 {
-                buf.extend_from_slice(&rng.rand().to_le_bytes());
-            }
-            while buf.len() % (LINE_SZ as usize) != 0 { buf.push(0); }
-        }
 
         {
             // Start a render pass, clearing the screen to black
@@ -245,28 +334,35 @@ async fn main() {
                 });
 
             render_pass.set_pipeline(&render_pipeline);
-            render_pass.set_bind_group(0, &fonts.bind_group, &[]);
+            render_pass.set_bind_group(1, &bind_group, &[]);
 
-            for line in 0..ROWS {
-                render_pass.set_bind_group(1, &bind_group, &[line * LINE_SZ]);
-                render_pass.draw(0..COLS * 6, line..line + 1);
+            for (font_size, push_constants, msg) in &strings {
+                // Set the font size
+                render_pass.set_bind_group(0,
+                    &fonts.fonts[*font_size as usize].bind_group, &[]);
+
+                // Write the constants
+                render_pass.set_push_constants(
+                    wgpu::ShaderStages::VERTEX, 0, push_constants.cast());
+
+                // Draw the text
+                render_pass.draw(0..(msg.len() * 6) as u32, 0..1);
             }
         }
 
         // Send the queue to the GPU
-        queue.write_buffer(&text_buffer, 0, buf.as_slice());
         queue.submit(Some(commands.finish()));
 
         // Present the texture to the surface
         texture.present();
 
-        while frame_times.len() >= 1024 {
+        while frame_times.len() >= 128 {
             frame_times.pop_front();
         }
 
         frame_times.push_back(it.elapsed().as_secs_f64());
 
-        if frame % 1024 == 0 {
+        if frame % 128 == 0 {
             let fps = (frame_times.len() - 1) as f64 /
                 (frame_times.back().unwrap() - frame_times.front().unwrap());
             println!("FPS {fps:10.4}");

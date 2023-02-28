@@ -1,25 +1,31 @@
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
-    @location(0) tex_coords: vec2<f32>,
-    @location(1) color: vec4<f32>,
+    @location(0)       tex_coords:    vec2<f32>,
+    @location(1)       color:         vec4<f32>,
 };
 
-// Window physical width and height
-const WW: f32 = 3840.0;
-const WH: f32 = 2160.0;
-
-// Font width and height
-const FW: f32 = 4.0;
-const FH: f32 = 6.0;
+struct Globals {
+    win_width:  f32,
+    win_height: f32,
+};
 
 @group(1) @binding(0) var<storage, read> text_data: array<u32>;
+@group(1) @binding(1) var<uniform> globals: Globals;
 
-// Top left coord
+// Font size
+@group(0) @binding(2) var<uniform> font_size: vec2<f32>;
+
+struct PushConstants {
+    rgba:   vec4<f32>,
+    xy:     vec2<f32>,
+    offset: u32,
+}
+
+var<push_constant> pc: PushConstants;
 
 @vertex
 fn vs_main(
     @builtin(vertex_index) ii: u32,
-    @builtin(instance_index) instance: u32,
 ) -> VertexOutput {
     var out: VertexOutput;
 
@@ -41,57 +47,38 @@ fn vs_main(
     let y = f32(div3 & 1u);
 
     // Figure out scaling
-    let WS = FW / WW * 2.0;
-    let HS = FH / WH * 2.0;
-
-    let sx = 0.0;
-    let sy = FH * f32(instance + 1u);
+    let WS = font_size.x / globals.win_width  * 2.0;
+    let HS = font_size.y / globals.win_height * 2.0;
 
     // Create the vertex
     out.clip_position = vec4(
-        -1.0 + f32(div6) * WS + x * WS + sx * (2.0 / WW),
-        -1.0 + y * HS + (WH - sy) * (2.0 / WH),
+        -1.0 + f32(div6) * WS + x * WS + pc.xy.x * (2.0 / globals.win_width),
+        -1.0 + y * HS + (globals.win_height - pc.xy.y) * (2.0 / globals.win_height),
         0.0,
         1.0,
     );
 
     // Compute texture coord
-    let char_and_color = text_data[div6];
-    let ch = char_and_color & 0xffu;
+    let char_and_color = text_data[pc.offset + (div6 >> 2u)];
+    let ch = (char_and_color >> ((div6 & 3u) * 8u)) & 0xffu;
     out.tex_coords = vec2(
         (1.0 / 16.0) * (f32(ch &  0xfu) + x),
         (1.0 / 16.0) * (f32(ch >> 0x4u) - y + 1.0),
     );
 
-    out.color = vec4(
-        f32((char_and_color >>  8u) & 0xffu) / 255.0,
-        f32((char_and_color >> 16u) & 0xffu) / 255.0,
-        f32((char_and_color >> 24u) & 0xffu) / 255.0,
-        1.0
-    );
+    out.color = pc.rgba;
 
     return out;
 }
 
 // All our fonts
-@group(0) @binding(0)  var font_4x6:   texture_2d<f32>;
-@group(0) @binding(1)  var font_6x8:   texture_2d<f32>;
-@group(0) @binding(2)  var font_6x9:   texture_2d<f32>;
-@group(0) @binding(3)  var font_6x10:  texture_2d<f32>;
-@group(0) @binding(4)  var font_8x12:  texture_2d<f32>;
-@group(0) @binding(5)  var font_8x14:  texture_2d<f32>;
-@group(0) @binding(6)  var font_8x15:  texture_2d<f32>;
-@group(0) @binding(7)  var font_8x16:  texture_2d<f32>;
-@group(0) @binding(8)  var font_12x20: texture_2d<f32>;
-@group(0) @binding(9)  var font_16x24: texture_2d<f32>;
-@group(0) @binding(10) var font_20x32: texture_2d<f32>;
-@group(0) @binding(11) var font_24x36: texture_2d<f32>;
+@group(0) @binding(0) var font_atlas: texture_2d<f32>;
 
 // Texture sampler for our fonts
-@group(0) @binding(12) var font_sampler: sampler;
+@group(0) @binding(1) var font_sampler: sampler;
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    return textureSample(font_4x6, font_sampler, in.tex_coords) * in.color;
+    return textureSample(font_atlas, font_sampler, in.tex_coords) * in.color;
 }
 
